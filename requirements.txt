@@ -6,3 +6,4 @@ pymorphy3>=2.0
 matplotlib>=3.7
 pytest>=8.0
 pyyaml>=6.0
+tqdm>=4.66

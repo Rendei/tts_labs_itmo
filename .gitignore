@@ -1,4 +1,7 @@
 data/*
+labs/*/data/*
+!labs/lab1_text/data/
+!labs/lab1_text/data/dev_sentences.csv
 *.wav
 *.npy
 *.pth
