@@ -131,7 +131,7 @@ def add_pause_labels(align: pd.DataFrame) -> pd.DataFrame:
             pause_duration.append(0.)
             is_last_word.append(False)
             last_word = idx
-    if last_word>=0:
+    if last_word >= 0:
         is_last_word[last_word] = True
     align['is_last_word'] = is_last_word
     align['is_pause_after'] = pause_after
