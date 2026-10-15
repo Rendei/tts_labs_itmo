@@ -1,42 +1,54 @@
 """Build the lab 3 training data from the MFA alignment — lab 3.
 
-Reads the TextGrids downloaded in lab 2 and writes two files.
+Reads the TextGrids downloaded in lab 2 and writes the files below (all in `data/`).
 
-`data/tokens_phones.csv` — **the training table**, one row per aligned token, in sentence
+`tokens_phones.csv` — **the training table**, one row per aligned word, in sentence
 order. Same shape as lab 2's `RUSLAN_pause_metadata.csv`, so the two labs read alike::
 
     id|token_id|token|phones|set
 
-`data/lexicon.csv` — the pronunciation dictionary, aggregated over the training fold::
+`tokens_phones_sil.csv` — the same table with a ``<SIL>`` row wherever the aligner put a
+pause, for the acoustic model of lab 4 (`token_id` counts the pauses too).
+
+`lexicon.csv` — the pronunciation dictionary, aggregated over the training fold::
 
     word|phones|count
+
+`russian_mfa.dict` — the original MFA dictionary, copied as is.
 
 The training table is the primary artifact: it keeps the sentence grouping, so a
 word-level model, a sentence-level model and anything contextual can all be built from it.
 `lexicon.csv` is a convenience summary for lookup and for word-level training, and it
 necessarily throws the context away.
 
+Utterances with a `spn` phone anywhere are dropped whole, in all three tables: `spn` marks
+a word the aligner had no pronunciation for (or an artefact on the recording), and a
+sentence with a hole in it is useless for a sequence model.
+
 Run from the lab directory::
 
-    python prepare_lexicon.py
+    python prepare_lexicon.py                                # the official markup, data/RUSLAN_align_v2
+    python prepare_lexicon.py ../../data/mfa/align_v3 v3     # lab 2's re-alignment, into data/v3/
 """
 import csv
 import glob
 import os
-import pandas as pd
+import shutil
+import sys
 import unicodedata
 from collections import Counter, defaultdict
 
+import pandas as pd
 from praatio import textgrid
 import tqdm
 
-ALIGN_DIR = '../../data/RUSLAN_22050_align_v2/'
+ALIGN_DIR = '../../data/RUSLAN_align_v2/'
 NORMALIZED_META = '../../data/metadata_RUSLAN_22200_normalized.csv'
-TOKENS_PATH = 'data/tokens_phones.csv'
-TOKENS_SIL_PATH = 'data/tokens_phones_sil.csv'
-LEXICON_PATH = 'data/lexicon.csv'
+MFA_DICT = '../../data/mfa/root/pretrained_models/dictionary/russian_mfa.dict'
+DATA_DIR = 'data'
 
 SIL = '<SIL>'
+SPN = 'spn'
 LENGTH_MARK = 'ː'
 TEST_EVERY = 5  # lab 2's split rule: test iff the utterance number divides by 5
 
@@ -80,19 +92,18 @@ def read_kept_ids(path: str) -> set[str] | None:
         return {line.split('|', 1)[0] for line in fh if line.strip()}
 
 
-def read_alignment(align_root: str, keep: set[str] | None, keep_sil=False) -> list[dict]:
-    """Read every TextGrid in `align_root` into per-token records.
+def read_alignment(align_root: str, keep: set[str] | None) -> list[dict]:
+    """Read every TextGrid in `align_root` into per-token records, pauses included.
 
     Args:
         align_root: Directory with `{id}.TextGrid` files.
         keep: Utterance ids to keep, or None for all.
-        keep_sil: retains `<SIL>` tokens if true, else drops them
 
     Returns:
-        One dict per aligned token with keys `id`, `token_id`, `token`, `phones`, `set`.
+        One dict per interval of the word tier with keys `id`, `token_id`, `token`, `phones`,
+        `set`. A pause has `token == phones == "<SIL>"`.
     """
     rows = []
-    print(sorted(glob.glob(os.path.join(align_root, '*.TextGrid'))))
     for path in tqdm.tqdm(sorted(glob.glob(os.path.join(align_root, '*.TextGrid')))):
         utterance_id = os.path.basename(path)[:-len('.TextGrid')]
         if keep is not None and utterance_id not in keep:
@@ -106,74 +117,98 @@ def read_alignment(align_root: str, keep: set[str] | None, keep_sil=False) -> li
         phones = [(p.start, p.end, p.label) for p in phone_tier.entries]
         fold = 'test' if int(utterance_id.split('_')[0]) % TEST_EVERY == 0 else 'train'
 
-        token_id = 0
-        for entry in word_tier.entries:
+        for token_id, entry in enumerate(word_tier.entries):
             if entry.label == '':
-                if not keep_sil:
-                    continue
-                current_phones = '<SIL>'
+                token = current_phones = SIL
             else:
+                token = unicodedata.normalize('NFC', entry.label)
                 current_phones = ' '.join(phones_of_token(phones, entry.start, entry.end))
             rows.append({
                 'id': utterance_id,
                 'token_id': token_id,
-                'token': unicodedata.normalize('NFC', entry.label),
+                'token': token,
                 'phones': current_phones,
                 'set': fold,
             })
-            token_id += 1
     return rows
+
+
+def drop_noisy_utterances(rows: list[dict]) -> tuple[list[dict], set[str]]:
+    """Remove every utterance that has a `spn` phone or a word without any phone.
+
+    Returns:
+        The remaining rows and the set of dropped utterance ids.
+    """
+    bad = {r['id'] for r in rows if SPN in r['phones'].split() or not r['phones']}
+    return [r for r in rows if r['id'] not in bad], bad
+
+
+def without_pauses(rows: list[dict]) -> list[dict]:
+    """Words only, numbered from zero inside each utterance."""
+    out, counters = [], Counter()
+    for row in rows:
+        if row['token'] == SIL:
+            continue
+        out.append({**row, 'token_id': counters[row['id']]})
+        counters[row['id']] += 1
+    return out
 
 
 def build_lexicon(rows: list[dict]) -> dict[str, Counter]:
     """Count pronunciations per token over the training fold only.
-
-    A `spn` phone marks a word the aligner had no pronunciation for: the interval has a
-    duration but no real transcription, so the row carries no lexical information.
 
     Building this over every fold instead would put the test words in the dictionary and
     make the reported PER meaningless.
     """
     lexicon: dict[str, Counter] = defaultdict(Counter)
     for row in rows:
-        if row['set'] != 'train':
-            continue
-        phones = row['phones'].split()
-        if not phones or 'spn' in phones:
-            continue
-        lexicon[row['token']][row['phones']] += 1
+        if row['set'] == 'train':
+            lexicon[row['token']][row['phones']] += 1
     return lexicon
 
 
-def main() -> None:
-    """Read the alignment, write the training table and the lexicon."""
-    rows = read_alignment(ALIGN_DIR, read_kept_ids(NORMALIZED_META), keep_sil=False)
-    utterances = {r['id'] for r in rows}
-    test = {r['id'] for r in rows if r['set'] == 'test'}
-    print(f'{len(rows)} tokens in {len(utterances)} utterances '
+def write_table(rows: list[dict], path: str) -> None:
+    pd.DataFrame(rows).to_csv(path, encoding='utf-8', quoting=csv.QUOTE_NONE, sep='|',
+                              index=False, header=True)
+
+
+def main(align_dir: str = ALIGN_DIR, subdir: str = '') -> None:
+    """Read the alignment, write the training tables, the lexicon and the MFA dictionary."""
+    out_dir = os.path.join(DATA_DIR, subdir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    rows = read_alignment(align_dir, read_kept_ids(NORMALIZED_META))
+    n_utterances = len({r['id'] for r in rows})
+    rows, dropped = drop_noisy_utterances(rows)
+    print(f'{n_utterances} utterances in {align_dir}, {len(dropped)} dropped for `spn` '
+          f'({len(dropped) / n_utterances:.1%})')
+
+    words = without_pauses(rows)
+    test = {r['id'] for r in words if r['set'] == 'test'}
+    utterances = {r['id'] for r in words}
+    print(f'{len(words)} tokens in {len(utterances)} utterances '
           f'({len(test)} test, {len(test) / max(len(utterances), 1):.1%})')
 
-    os.makedirs(os.path.dirname(TOKENS_PATH), exist_ok=True)
+    write_table(words, os.path.join(out_dir, 'tokens_phones.csv'))
+    write_table(rows, os.path.join(out_dir, 'tokens_phones_sil.csv'))
 
-    pd.DataFrame(rows).to_csv(TOKENS_PATH, encoding='utf-8', quoting=csv.QUOTE_NONE, sep='|', index=False, header=True)
-    pd.DataFrame(
-        read_alignment(ALIGN_DIR, read_kept_ids(NORMALIZED_META), keep_sil=True)
-        ).to_csv(TOKENS_SIL_PATH, encoding='utf-8', quoting=csv.QUOTE_NONE, sep='|', index=False, header=True)
-    
-    
-    lexicon = build_lexicon(rows)
-
+    lexicon = build_lexicon(words)
     variants = sum(1 for counts in lexicon.values() if len(counts) > 1)
     print(f'lexicon from the train fold: {len(lexicon)} types, '
           f'{variants} with several pronunciations')
 
-    with open(LEXICON_PATH, 'w', encoding='utf-8', newline='') as fh:
+    with open(os.path.join(out_dir, 'lexicon.csv'), 'w', encoding='utf-8', newline='') as fh:
         writer = csv.writer(fh, delimiter='|', quoting=csv.QUOTE_NONE)
         writer.writerow(['word', 'phones', 'count'])
         for word in sorted(lexicon):
             for phones, count in lexicon[word].most_common():
                 writer.writerow([word, phones, count])
 
+    if os.path.isfile(MFA_DICT):
+        shutil.copyfile(MFA_DICT, os.path.join(out_dir, 'russian_mfa.dict'))
+    else:
+        print(f'{MFA_DICT} not found: download russian_mfa.dict by hand into {out_dir}')
+
 
 if __name__ == '__main__':
-    main()
+    main(*sys.argv[1:3])
