@@ -68,7 +68,7 @@ def phones_of_token(phones: list[tuple[float, float, str]],
 
     Returns:
         Phone labels in time order, NFC-normalized with the length mark collapsed to match
-        `configs/phones_mfa.txt`. An empty label (silence) becomes ``"<SIL>"``.
+        `common/phones_mfa.txt`. An empty label (silence) becomes ``"<SIL>"``.
     """
     out = []
     for phone_start, phone_end, label in phones:
