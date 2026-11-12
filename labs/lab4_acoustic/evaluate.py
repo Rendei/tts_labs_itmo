@@ -56,6 +56,11 @@ def parse_args():
                    help="training metadata, used only for the constant-mel reference")
     p.add_argument("--limit", type=int, default=None,
                    help="synthesize only the first N sentences, for a quick check")
+    p.add_argument("--out-name", default="eval",
+                   help="output subdirectory of the run, e.g. eval_g2p for --eval-set "
+                        "with G2P phones")
+    p.add_argument("--save-mels", action="store_true",
+                   help="also write mels/{id}_natural.npy and mels/{id}_model.npy for analysis")
     return p.parse_args()
 
 
@@ -190,9 +195,11 @@ def main() -> None:
     model.load_state_dict(torch.load(str(checkpoint), map_location="cpu")["model"])
     model.eval()
 
-    out = args.run / "eval"
-    for sub in ("natural", "copysynth", "model"):
+    out = args.run / args.out_name
+    for sub in ("natural", "copysynth", "model") + (("mels",) if args.save_mels else ()):
         (out / sub).mkdir(parents=True, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
 
     rows = read_eval_set(args.eval_set, args.limit)
     print(f"evaluation sentences: {len(rows)}\n")
@@ -216,6 +223,14 @@ def main() -> None:
         ap.save_wav(natural_wav, str(out / "natural" / f"{utt_id}.wav"))
         ap.save_wav(ap.inv_melspectrogram(natural_mel), str(out / "copysynth" / f"{utt_id}.wav"))
         ap.save_wav(result["wav"], str(out / "model" / f"{utt_id}.wav"))
+        if args.save_mels:
+            np.save(out / "mels" / f"{utt_id}_natural.npy", natural_mel.astype(np.float32))
+            np.save(out / "mels" / f"{utt_id}_model.npy", model_mel.astype(np.float32))
+            # frames per input phone, as the length regulator used them (ForwardTTS.format_durations)
+            dur = (torch.exp(result["outputs"]["durations_log"]) - 1) * model.length_scale
+            dur = torch.round(torch.clamp(dur, min=1.0))
+            np.save(out / "mels" / f"{utt_id}_durations.npy",
+                    dur.detach().cpu().numpy().reshape(-1).astype(np.float32))
 
         constant_mel = np.repeat(constant_frame[:, None], natural_mel.shape[1], axis=1)
         records.append({

@@ -28,7 +28,7 @@ from sklearn.metrics import mean_absolute_error
 PAUSE_PREDICTOR_DATA = 'data/RUSLAN_pause_metadata.csv'
 MODEL_PATH = Path(__file__).resolve().parent / 'models' / 'pause_model.pkl'
 
-MIN_PAUSE = 0.06      # pauses shorter than this are treated as "no pause" when training
+MIN_PAUSE = 0.06      # with the 'y60' target, pauses shorter than this are treated as "no pause" (the shipped model uses 'raw')
 MIN_DURATION = 0.03   # shortest pause the predictor ever returns (the floor of the MFA markup)
 
 _TOKEN_RE = re.compile(r"^([^\w]*)(\w[\w\u0301\-'’]*)?(.*)$", re.S)   # \u0301: combining stress mark, part of a word
@@ -324,17 +324,44 @@ class PausePredictor():
         self.threshold = threshold
         return self
 
-    def fit_from_csv(self, path: str = PAUSE_PREDICTOR_DATA) -> 'PausePredictor':
-        """Train on the `train` part of the prepared table.
+    def fit_from_csv(self, path: str = PAUSE_PREDICTOR_DATA, clf_label: str = 'raw',
+                     reg_label: str = 'raw') -> 'PausePredictor':
+        """Train on the `train` part of the prepared table; this is the recipe of the shipped model.
 
-        Pauses shorter than MIN_PAUSE are treated as "no pause"; the last word of every sentence is kept
-        with label 0 so the model sees sentence endings but is never scored on them.
+        Targets (`clf_label` for the pause classifier, `reg_label` for the duration regressor):
+
+        * ``'raw'`` — the markup as it is: every pause of the aligner counts, including the 30-50 ms ones
+          (this is what the task's metric is computed against);
+        * ``'y60'`` — only pauses of at least MIN_PAUSE count; shorter ones are treated as "no pause".
+
+        The last word of every sentence is kept with label 0, so the model sees sentence endings but is never
+        scored on them. The probability threshold is chosen first: models are trained on the utterances with
+        ``number % 5 != 1``, and the threshold is the one that maximises F1 for `is_pause_after` on the rest of
+        `train`; then the models are re-trained on the whole `train` part.
         """
         df = pd.read_csv(path, sep='|', quoting=csv.QUOTE_NONE)
-        df = df[df.set == 'train']
-        _, sentences, _ = sentences_from_frame(df)
-        y = ((df.pause_duration.values >= MIN_PAUSE) & (df.is_last_word.values == 0)).astype(int)
-        return self.fit(sentences, y, df.pause_duration.values, threshold=0.4)
+        df = df[df.set == 'train'].reset_index(drop=True)
+        fold = df.id.str.split('_').str[0].astype(int) % 5
+
+        def targets(frame: pd.DataFrame) -> tuple[list[list[str]], np.ndarray, np.ndarray, np.ndarray]:
+            _, sentences, _ = sentences_from_frame(frame)
+            not_last = frame.is_last_word.values == 0
+            pause = {'raw': (frame.is_pause_after.values == 1) & not_last,
+                     'y60': (frame.pause_duration.values >= MIN_PAUSE) & not_last}
+            return (sentences, pause[clf_label].astype(int), frame.pause_duration.values,
+                    pause[reg_label].astype(bool))
+
+        fit_part, val_part = df[fold != 1].reset_index(drop=True), df[fold == 1].reset_index(drop=True)
+        s_fit, y_fit, d_fit, m_fit = targets(fit_part)
+        self.fit(s_fit, y_fit, d_fit, duration_mask=m_fit)
+        proba, _ = self.predict_proba_many(targets(val_part)[0])
+        scored = val_part.is_last_word.values == 0
+        grid = np.arange(0.05, 0.801, 0.025)
+        f1s = [f1_score(val_part.is_pause_after.values[scored], proba[scored] >= t) for t in grid]
+        threshold = float(grid[int(np.argmax(f1s))])
+
+        sentences, y, durations, dur_mask = targets(df)
+        return self.fit(sentences, y, durations, duration_mask=dur_mask, threshold=threshold)
 
     def save(self, path: str | Path = MODEL_PATH) -> None:
         """Pickle the trained models."""
