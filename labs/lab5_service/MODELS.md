@@ -1,7 +1,7 @@
 # Модели для конвейера синтеза (лабораторная 5)
 
 Веса в git не хранятся: GitHub не принимает LFS-файлы в публичных форках, а модель
-лабы 4 больше лимита в 100 МБ. Они распространяются архивом `tts_models_lab5.zip` (~210 МБ).
+лабы 4 больше лимита в 100 МБ. Они распространяются архивом `tts_models_lab5.zip` (196 МБ).
 
 ## Что в архиве
 
@@ -15,7 +15,6 @@
 | `labs/lab5_service/models/vocoder_gta/hyperparams.yaml` | 4 КБ | гиперпараметры SpeechBrain к нему |
 | `labs/lab3_g2p/data/russian_mfa.dict` | 24 МБ | словарь MFA для транскриптора лабы 3 |
 | `labs/lab3_g2p/data/v3/lexicon.csv` | 2 МБ | лексикон RUSLAN для транскриптора лабы 3 |
-| `labs/lab5_service/MODELS.md` | - | этот файл |
 
 Остальные модели в репозитории уже есть: `labs/lab2_pauses/models/pause_model.pkl`,
 `labs/lab3_g2p/models/oov_model.pkl.gz`, `labs/lab3_g2p/models/variant_chooser.pkl.gz`.
