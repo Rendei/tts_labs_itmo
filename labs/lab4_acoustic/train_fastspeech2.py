@@ -21,8 +21,18 @@ coqui's mel against SpeechBrain's frame by frame:
 
 
 """
-import argparse
 import os
+
+# One BLAS/OpenMP thread per process. Every data-loader worker computes mels with numpy, and
+# by default each one starts as many BLAS threads as there are cores: 8 workers x 20 threads
+# on a 20-thread CPU. On Windows that oversubscription made batch loading take 5-20 s and the
+# GPU sat idle (measured: 1-5 s/step -> 0.1-0.2 s/step after this). Must precede numpy import;
+# spawned workers inherit the environment.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
+import argparse
+import copy
 import sys
 import unicodedata
 from pathlib import Path
@@ -39,6 +49,35 @@ from TTS.utils.audio import AudioProcessor
 
 MULTICHAR_CLASS = "TTS.tts.utils.text.characters.MulticharPhonemes"
 SAMPLE_RATE = 22050
+PITCH_FMIN, PITCH_FMAX = 50.0, 300.0  # male speaker, see --pitch-energy
+
+
+def fix_attention_mask_order() -> None:
+    """Give every utterance its own precomputed alignment in coqui's collate_fn.
+
+    `TTSDataset.collate_fn` sorts the batch by text length and then indexes the attention
+    masks with the same permutation a second time (`batch["attn"][idx] for idx in
+    ids_sorted_decreasing`, on a list that is already sorted). With --durations and shuffled
+    batches each row then trains on another utterance's durations, trimmed to fit, and the
+    decoder never leaves the mean-spectrum plateau. Returning the identity permutation from
+    `_sort_batch` makes the second indexing a no-op; nothing else in collate_fn uses it.
+    Applied at import time so that spawned DataLoader workers, which re-import this script
+    but do not run main(), get it too. Without --durations the masks are None and this
+    changes nothing.
+    """
+    import torch
+    from TTS.tts.datasets.dataset import TTSDataset
+
+    original = TTSDataset._sort_batch
+
+    def _sort_batch(batch, text_lengths):
+        batch, text_lengths, ids = original(batch, text_lengths)
+        return batch, text_lengths, torch.arange(len(ids))
+
+    TTSDataset._sort_batch = staticmethod(_sort_batch)
+
+
+fix_attention_mask_order()
 
 
 def parse_args():
@@ -67,6 +106,45 @@ def parse_args():
     p.add_argument("--durations", type=Path, default=None,
                    help="ablation: a wav|npy manifest of precomputed alignments from "
                         "prepare_mfa_durations.py. Turns the internal aligner off")
+
+    # --- additions for lab 4 experiments; defaults keep the shipped behaviour ---
+    p.add_argument("--lr-schedule", choices=("epoch", "step"), default="epoch",
+                   help="when NoamLR advances. 'epoch' is what the shipped config does "
+                        "(the trainer's scheduler_after_epoch=True): warm-up then lasts "
+                        "4000 *epochs* and the effective lr is lr*epoch/4000. 'step' is the "
+                        "Transformer/FastSpeech2 schedule: peak lr at step 4000, then 1/sqrt")
+    p.add_argument("--warmup-steps", type=int, default=4000, help="NoamLR warm-up")
+    p.add_argument("--precision", choices=("fp32", "tf32", "bf16", "fp16"), default="fp32",
+                   help="tf32/bf16/fp16 use the tensor cores of Ampere+ GPUs; the audio "
+                        "pipeline is untouched")
+    p.add_argument("--init-from", type=Path, default=None,
+                   help="initialize the weights from this checkpoint (strict=False, so new "
+                        "modules such as pitch/energy predictors start fresh and a fresh "
+                        "optimizer is used), as suggested by the README for the ablations")
+    p.add_argument("--num-workers", type=int, default=8, help="data loader workers")
+    p.add_argument("--save-step", type=int, default=10000, help="checkpoint every N steps")
+    p.add_argument("--keep-checkpoints", type=int, default=5,
+                   help="how many periodic checkpoints to keep (comparisons at equal steps "
+                        "need the older ones)")
+    p.add_argument("--shuffle", action="store_true",
+                   help="shuffle the training batches. coqui's default (shuffle=False, "
+                        "batch_group_size=0) feeds every epoch in the same order, sorted from "
+                        "the shortest utterance to the longest")
+    p.add_argument("--gpu-mem-fraction", type=float, default=None,
+                   help="cap PyTorch's share of GPU memory (e.g. 0.8 on an 8 GB card). Without a "
+                        "cap the caching allocator fragments past the card's size and the "
+                        "Windows driver silently spills to system RAM, several times slower")
+    p.add_argument("--persistent-workers", action="store_true",
+                   help="keep data-loader workers alive between epochs. On Windows workers are "
+                        "spawned, not forked: re-creating 6 of them costs ~45 s every epoch")
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="shared F0/energy cache from precompute_pitch_energy.py; by default "
+                        "coqui computes it inside the run directory before the first step")
+    p.add_argument("--continue-path", type=Path, default=None,
+                   help="resume a finished or interrupted run from its newest checkpoint in this "
+                        "folder: weights, optimizer, scheduler and step counter. The run keeps its "
+                        "own config.json; only --epochs is taken from the command line, so the "
+                        "other flags must repeat the original ones (they still build the data)")
     return p.parse_args()
 
 
@@ -141,6 +219,26 @@ def build_audio_config() -> BaseAudioConfig:
 
 
 
+def enable_persistent_workers() -> None:
+    """Make coqui's data loaders keep their worker processes between epochs.
+
+    coqui builds `torch.utils.data.DataLoader` inside `BaseTTS.get_data_loader` without
+    `persistent_workers`, so every epoch tears the workers down and starts new ones. The
+    trainer creates each loader once per run, so swapping the class it calls is enough.
+    """
+    import TTS.tts.models.base_tts as base_tts
+
+    original = base_tts.DataLoader
+
+    def loader(*args, **kwargs):
+        if kwargs.get("num_workers", 0) > 0:
+            kwargs.setdefault("persistent_workers", True)
+        return original(*args, **kwargs)
+
+    base_tts.DataLoader = loader
+    print("data loader workers: persistent")
+
+
 def preflight(tokenizer, samples, n: int = 200) -> None:
     """Abort before the first epoch if any phone is missing from the vocabulary.
 
@@ -207,15 +305,15 @@ def main() -> None:
         audio=build_audio_config(),
         batch_size=args.batch_size,
         eval_batch_size=max(2, args.batch_size // 2),
-        num_loader_workers=8,
-        num_eval_loader_workers=4,
+        num_loader_workers=args.num_workers,
+        num_eval_loader_workers=min(4, args.num_workers),
         model_args=model_args,
         lr=args.lr,
         compute_input_seq_cache=True,
         compute_f0=args.pitch_energy,
-        f0_cache_path=str(output_path / "f0_cache"),
+        f0_cache_path=str((args.cache_dir or output_path) / ("f0" if args.cache_dir else "f0_cache")),
         compute_energy=args.pitch_energy,
-        energy_cache_path=str(output_path / "energy_cache"),
+        energy_cache_path=str((args.cache_dir or output_path) / ("energy" if args.cache_dir else "energy_cache")),
         run_eval=True,
         test_delay_epochs=-1,
         epochs=args.epochs,
@@ -235,7 +333,14 @@ def main() -> None:
         precompute_num_workers=4,
         print_step=50,
         print_eval=False,
-        mixed_precision=False,  # a 1080Ti is Pascal; fp16 buys nothing here
+        mixed_precision=args.precision in ("bf16", "fp16"),  # a 1080Ti is Pascal; fp16 buys nothing there
+        precision=args.precision if args.precision in ("bf16", "fp16") else "fp16",
+        allow_tf32=args.precision != "fp32",
+        scheduler_after_epoch=args.lr_schedule == "epoch",
+        lr_scheduler_params={"warmup_steps": args.warmup_steps},
+        save_step=args.save_step,
+        save_n_checkpoints=args.keep_checkpoints,
+        shuffle=args.shuffle,
         max_seq_len=200,
         max_audio_len=int(args.max_audio_seconds * SAMPLE_RATE),
         output_path=str(output_path),
@@ -247,8 +352,8 @@ def main() -> None:
         # at roughly 70-200 Hz that window is wrong in both directions: it admits octave
         # errors at the top and DC at the bottom, and it makes librosa.pyin crawl through
         # the f0 cache because the search range is nine times wider than it needs to be.
-        config.audio.pitch_fmin = 50.0
-        config.audio.pitch_fmax = 300.0
+        config.audio.pitch_fmin = PITCH_FMIN
+        config.audio.pitch_fmax = PITCH_FMAX
         print(f"f0 range: {config.audio.pitch_fmin}-{config.audio.pitch_fmax} Hz "
               f"(coqui's 1-640 default is wrong for this speaker)")
 
@@ -270,15 +375,52 @@ def main() -> None:
     # than Russian text. Taking them from the eval split guarantees every token is known.
     config.test_sentences = [item["text"] for item in eval_samples[:3]]
 
+    print(f"lr {args.lr:g}, NoamLR warm-up {args.warmup_steps}, advanced per {args.lr_schedule}; "
+          f"precision {args.precision}")
+
+    import torch
+    if args.gpu_mem_fraction is not None and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_fraction)
+        print(f"GPU memory capped at {args.gpu_mem_fraction:.0%} of "
+              f"{torch.cuda.get_device_properties(0).total_memory / 2**30:.1f} GiB")
+    print(f"shuffle batches: {args.shuffle}")
+    if args.persistent_workers:
+        enable_persistent_workers()
+
     model = ForwardTTS(config, ap, tokenizer, speaker_manager=None)
+    if args.init_from is not None:
+        state = torch.load(str(args.init_from), map_location="cpu")["model"]
+        own = model.state_dict()
+        # drop tensors whose shape changed; strict=False alone does not forgive that
+        state = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+        result = model.load_state_dict(state, strict=False)
+        print(f"init from {args.init_from}: loaded {len(state)} tensors, "
+              f"{len(result.missing_keys)} left at random init")
+        for key in result.missing_keys[:20]:
+            print(f"    fresh: {key}")
+    trainer_args = TrainerArgs()
+    characters = copy.deepcopy(config.characters)   # the continue path overwrites config in place
+    if args.continue_path is not None:
+        trainer_args.continue_path = str(args.continue_path)
     trainer = Trainer(
-        TrainerArgs(),
+        trainer_args,
         config,
         str(output_path),
         model=model,
         train_samples=train_samples,
         eval_samples=eval_samples,
     )
+    if args.continue_path is not None:
+        # the trainer has replaced the config with the run's config.json, epochs included;
+        # extending a finished run needs the new total, and config.json should record it.
+        # Coqpit cannot read the phone list back from JSON (a list where it expects a str)
+        # and sets it to None; the tokenizer is already built, but evaluate.py reads the
+        # list from config.json, so put it back.
+        trainer.config.epochs = args.epochs
+        trainer.config.characters = characters
+        trainer.config.save_json(str(Path(trainer.output_path) / "config.json"))
+        print(f"continuing {args.continue_path} from step {trainer.total_steps_done - 1}, "
+              f"epoch {trainer.epochs_done}, up to epoch {args.epochs}")
     trainer.fit()
 
 
