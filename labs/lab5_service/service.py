@@ -30,7 +30,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from tts_pipeline import DEFAULT_RUN, SAMPLE_RATE, TTSPipeline
+from tts_pipeline import DEFAULT_RUN, SAMPLE_RATE, VOCODER_GTA, TTSPipeline
 
 MAX_CHARS = 5000            # one request must not hold the GPU for minutes
 
@@ -128,7 +128,8 @@ def mount_demo(app: FastAPI, synthesize) -> FastAPI:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--run', type=Path, default=DEFAULT_RUN, help='lab 4 run directory')
-    p.add_argument('--vocoder', default=None, help='HiFi-GAN hub id or local directory')
+    p.add_argument('--vocoder', default=None,
+                   help="HiFi-GAN hub id or local directory; 'gta' = the vocoder fine-tuned on GTA mels")
     p.add_argument('--device', default='cuda')
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--port', type=int, default=8000)
@@ -137,6 +138,8 @@ def main() -> None:
                    help='also open a temporary public Gradio link (*.gradio.live)')
     args = p.parse_args()
 
+    if args.vocoder == 'gta':
+        args.vocoder = str(VOCODER_GTA)
     kwargs = {'vocoder_source': args.vocoder} if args.vocoder else {}
     pipeline = TTSPipeline(args.run, device=args.device, **kwargs)
     pipeline('Прогрев.')                                  # first call: CUDA/cuDNN initialization
