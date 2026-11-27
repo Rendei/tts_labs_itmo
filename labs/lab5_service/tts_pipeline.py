@@ -53,7 +53,11 @@ SAMPLE_RATE = 22050
 VOCODER_SOURCE = 'speechbrain/tts-hifigan-libritts-22050Hz'
 PHONES_FILE = ROOT / 'common' / 'phones_mfa.txt'
 LEXICON_FILE = ROOT / 'labs' / 'lab3_g2p' / 'data' / 'v3' / 'lexicon.csv'
-DEFAULT_RUN = ROOT / 'labs' / 'lab4_acoustic' / 'runs' / 'pitch_energy'
+# Final models, kept in git LFS: lab 4 `pitch_energy` (weights only, no optimizer state)
+# and HiFi-GAN fine-tuned on GTA mels (report, section 9). Training runs stay in `runs/`.
+MODELS = HERE / 'models'
+DEFAULT_RUN = MODELS / 'acoustic_pitch_energy'
+VOCODER_GTA = MODELS / 'vocoder_gta'
 
 # Longest phone sequence sent to the acoustic model in one call. Utterances of the lab 4
 # training set (<= 10 s) have at most ~150 phones; see the report, section 4.

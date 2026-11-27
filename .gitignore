@@ -26,3 +26,6 @@ labs/lab4_acoustic/runs/
 labs/lab5_service/pretrained_models/
 labs/lab5_service/runs/
 !labs/lab5_service/audio/**/*.wav
+
+# final models for the pipeline: not in git, distributed as a zip (labs/lab5_service/MODELS.md)
+labs/lab5_service/models/
